@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Голосовой таймер</title>
+  <meta name="description" content="Таймер с голосовым оповещением">
+  <meta name="theme-color" content="#1e293b">
+
+  <!-- PWA -->
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="icon" href="icons/icon-192.png" type="image/png" sizes="192x192">
+  <!-- iOS: «На экран Домой» -->
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Таймер">
+
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --accent: #22c55e;
+      --danger: #ef4444;
+      --neutral: #475569;
+      --warn: #f59e0b;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom);
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    main {
+      width: 100%;
+      max-width: 420px;
+      background: var(--card);
+      border-radius: 20px;
+      padding: 24px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.4);
+    }
+    h1 { margin: 0 0 16px; font-size: 1.4rem; text-align: center; }
+    .display {
+      font-size: 4.5rem;
+      font-variant-numeric: tabular-nums;
+      text-align: center;
+      margin: 8px 0 20px;
+      letter-spacing: 2px;
+    }
+    .display.finished { color: var(--accent); animation: flash 1s ease-in-out 3; }
+    @keyframes flash { 50% { opacity: .2; } }
+    label { display: block; color: var(--muted); font-size: .9rem; margin-bottom: 6px; }
+    .field { margin-bottom: 16px; }
+    input, select {
+      width: 100%;
+      font-size: 1.1rem;
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid var(--neutral);
+      background: var(--bg);
+      color: var(--text);
+    }
+    input:invalid { border-color: var(--danger); }
+    .hint { color: var(--danger); font-size: .85rem; min-height: 1.1em; margin-top: 4px; }
+    .status { color: var(--muted); font-size: .8rem; min-height: 1.1em; margin-top: 14px; text-align: center; }
+    .status.warn { color: var(--warn); }
+    .buttons { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 8px; }
+    button {
+      font-size: 1.05rem;
+      padding: 14px 0;
+      border: 0;
+      border-radius: 12px;
+      color: #fff;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+    button:disabled { opacity: .4; cursor: default; }
+    .alert {
+      border: 1px solid var(--warn);
+      background: rgba(245, 158, 11, .12);
+      border-radius: 12px;
+      padding: 12px 14px;
+      margin-bottom: 16px;
+      font-size: .9rem;
+      line-height: 1.35;
+      -webkit-user-select: text;
+      user-select: text;
+    }
+    .alert.error { border-color: var(--danger); background: rgba(239, 68, 68, .12); }
+    .alert[hidden] { display: none; }
+    .alert strong { display: block; margin-bottom: 4px; }
+    .alert code { font-size: .85em; background: var(--bg); padding: 1px 4px; border-radius: 4px; }
+    .alert button { margin-top: 10px; padding: 8px 14px; font-size: .9rem; background: var(--neutral); }
+    #start { background: var(--accent); }
+    #stop  { background: var(--danger); }
+    #reset { background: var(--neutral); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Голосовой таймер</h1>
+
+    <div class="display" id="display" aria-live="polite">05:00</div>
+
+    <div class="alert" id="audioAlert" role="alert" hidden>
+      <strong id="alertTitle"></strong>
+      <div id="alertText"></div>
+      <button id="alertRetry" type="button">Повторить</button>
+    </div>
+
+    <div class="field">
+      <label for="minutes">Минуты (1–60)</label>
+      <input id="minutes" type="number" inputmode="numeric" min="1" max="60" step="1" value="5" required>
+      <div class="hint" id="hint"></div>
+    </div>
+
+    <div class="field">
+      <label for="voice">Голос</label>
+      <select id="voice"></select>
+    </div>
+
+    <div class="buttons">
+      <button id="start" type="button">Старт</button>
+      <button id="stop" type="button" disabled>Стоп</button>
+      <button id="reset" type="button">Сброс</button>
+    </div>
+
+    <div class="status" id="status"></div>
+  </main>
+
+  <script>
+    'use strict';
+    const $ = (id) => document.getElementById(id);
+    const display = $('display'), minutesInput = $('minutes'), hint = $('hint'), statusEl = $('status');
+    const voiceSelect = $('voice'), startBtn = $('start'), stopBtn = $('stop'), resetBtn = $('reset');
+    const alertBox = $('audioAlert'), alertTitle = $('alertTitle'), alertText = $('alertText'), alertRetry = $('alertRetry');
+
+    const AUDIO_ROOT = 'audio/';
+    const FALLBACK_VOICES = [{ id: 'Milena', name: 'Milena' }];
+    const STALE_S = 0.3;      // событие, опоздавшее сильнее, пропускаем (кроме «Время вышло»)
+    const RESYNC_S = 0.02;    // перепланируем источник, если расписание уехало больше чем на 20 мс
+    const TICK_MS = 100;
+
+    // ---------- Состояние таймера ----------
+    // Источник истины — performance.now(): монотонные часы, не зависят от смены системного времени.
+    let endTime = 0;        // момент окончания (ms, performance.now)
+    let remainingMs = 0;    // остаток при паузе
+    let tickId = null;
+    let events = [];        // запланированные фразы: { at (ms perf), key, src, when, state }
+
+    // ---------- Статус ----------
+    const statusParts = { net: '', audio: '', wake: '' };
+    const statusWarn = { net: false, audio: false, wake: false };
+    function setStatus(part, text, warn = false) {
+      statusParts[part] = text;
+      statusWarn[part] = warn;
+      statusEl.textContent = Object.values(statusParts).filter(Boolean).join(' · ');
+      statusEl.classList.toggle('warn', Object.values(statusWarn).some(Boolean));
+    }
+
+    // ---------- Сообщение об ошибке аудио ----------
+    const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    function showAlert(title, html, { error = true, retry = true } = {}) {
+      alertTitle.textContent = title;
+      alertText.innerHTML = html;
+      alertRetry.hidden = !retry;
+      alertBox.classList.toggle('error', error);
+      alertBox.hidden = false;
+    }
+    function hideAlert() { alertBox.hidden = true; }
+
+    // Ошибка загрузки с причиной: offline — нет сети и файла нет в кэше; missing — файла нет на сервере;
+    // invalid — файл есть, но испорчен; http — прочие ответы сервера.
+    class LoadError extends Error {
+      constructor(reason, detail = '') { super(`${reason} ${detail}`.trim()); this.reason = reason; }
+    }
+    async function fetchChecked(url, opts) {
+      let r;
+      try { r = await fetch(url, opts); } catch (_) { throw new LoadError('offline'); }
+      if (r.status === 404 || r.status === 410) throw new LoadError('missing', r.status);
+      if (!r.ok) throw new LoadError('http', r.status);
+      // SPA-хостинги вместо 404 отдают index.html со статусом 200.
+      if ((r.headers.get('content-type') || '').includes('text/html')) throw new LoadError('missing', 'html');
+      return r;
+    }
+    const isOffline = () => navigator.onLine === false;
+
+    // ---------- Web Audio ----------
+    const AC = window.AudioContext || window.webkitAudioContext;
+    let ctx = null, master = null;
+
+    // iOS 17+: категория «playback» — звук не глушится переключателем «Без звука».
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (_) {}
+
+    function getCtx() {
+      if (ctx || !AC) return ctx;
+      try { ctx = new AC({ latencyHint: 'interactive' }); } catch (_) { ctx = new AC(); }
+      master = ctx.createGain();
+      master.connect(ctx.destination);
+      ctx.onstatechange = () => { if (ctx.state === 'running') pump(); };
+      return ctx;
+    }
+
+    // Разблокировка звука (iOS/Safari и Chrome требуют жест пользователя).
+    // Вызывать синхронно из обработчика нажатия — до любых await.
+    function unlockAudio() {
+      const c = getCtx();
+      if (!c) return Promise.resolve();
+      if (c.state !== 'running') {
+        // iOS: проигрывание пустого буфера внутри жеста «будит» аудиосессию.
+        const b = c.createBuffer(1, 1, c.sampleRate);
+        const s = c.createBufferSource();
+        s.buffer = b; s.connect(c.destination); s.start(0);
+      }
+      return c.resume ? c.resume().catch(() => {}) : Promise.resolve();
+    }
+    ['touchend', 'pointerdown', 'keydown'].forEach((t) =>
+      document.addEventListener(t, () => { if (!ctx || ctx.state !== 'running') unlockAudio(); }, { passive: true }));
+
+    function decodeAudio(ab) {
+      return new Promise((resolve, reject) => {
+        // Старый Safari умеет только колбэки, новый — промис; поддерживаем оба.
+        const p = ctx.decodeAudioData(ab, resolve, reject);
+        if (p && p.then) p.then(resolve, reject);
+      });
+    }
+
+    // Связь часов: ctxTime = perfMs / 1000 + clockOffset.
+    // getOutputTimestamp даёт пару (время контекста, которое сейчас звучит в динамике ↔ performance.now),
+    // так что фраза начинает звучать ровно в нужный момент с учётом задержки вывода.
+    let clockOffset = null;
+    function sampleClock() {
+      let c = ctx.currentTime, p = performance.now();
+      if (ctx.getOutputTimestamp) {
+        const t = ctx.getOutputTimestamp();
+        if (t.contextTime > 0 && t.performanceTime > 0 && Math.abs(t.performanceTime - p) < 1000) {
+          c = t.contextTime; p = t.performanceTime;
+        }
+      }
+      const o = c - p / 1000;
+      // Сглаживаем дрожание; при скачке (контекст был приостановлен) — берём сразу.
+      if (clockOffset === null || Math.abs(o - clockOffset) > 0.1) clockOffset = o;
+      else clockOffset += (o - clockOffset) * 0.1;
+    }
+    const toCtxTime = (perfMs) => perfMs / 1000 + clockOffset;
+
+    // ---------- Банк фраз выбранного голоса ----------
+    // Все фразы, которые создаёт tools/make_audio.py (для проверки полноты голоса).
+    const ALL_KEYS = ['left_30s', 'resume', 'pause', 'done'];
+    for (let n = 1; n <= 60; n++) ALL_KEYS.push(`start_${n}`, `left_min_${n}`);
+    for (let n = 1; n <= 10; n++) ALL_KEYS.push(`count_${n}`);
+
+    // missing: ключ → причина (offline | missing | invalid | http), error — фатальная ошибка голоса.
+    const newBank = (id) => ({ voice: id, raw: new Map(), decoded: new Map(), pending: new Map(),
+                               missing: new Map(), error: null, ready: Promise.resolve(), offlineReady: false });
+    let bank = newBank(null);
+
+    function loadVoice(id) {
+      const b = newBank(id);
+      bank = b;
+      hideAlert();
+      const base = `${AUDIO_ROOT}${encodeURIComponent(id)}/`;
+      b.ready = (async () => {
+        setStatus('audio', 'Загрузка голоса…');
+        let meta;
+        const r = await fetchChecked(base + 'phrases.json');
+        try { meta = await r.json(); } catch (_) { throw new LoadError('invalid', 'phrases.json'); }
+        if (!meta || typeof meta.phrases !== 'object' || !Object.keys(meta.phrases).length) {
+          throw new LoadError('invalid', 'phrases.json');
+        }
+        // Фразы, которых нет даже в списке, считаем отсутствующими.
+        const listed = Object.keys(meta.phrases);
+        ALL_KEYS.forEach((k) => { if (!(k in meta.phrases)) b.missing.set(k, 'missing'); });
+        let done = 0, i = 0;
+        // Сжатые файлы (~1–2 МБ на голос) грузим заранее все; декодируем — по необходимости.
+        const worker = async () => {
+          while (i < listed.length) {
+            const k = listed[i++];
+            try {
+              const res = await fetchChecked(`${base}${k}.m4a`);
+              const ab = await res.arrayBuffer();
+              if (!ab.byteLength) throw new LoadError('invalid');
+              b.raw.set(k, ab);
+            } catch (e) { b.missing.set(k, e.reason || 'offline'); }
+            done++;
+            if (bank === b) setStatus('audio', `Загрузка голоса: ${done}/${listed.length}`);
+          }
+        };
+        await Promise.all(Array.from({ length: 6 }, worker));
+        if (bank !== b) return;
+        if (!b.raw.size) throw new LoadError([...b.missing.values()].includes('offline') ? 'offline' : 'missing');
+        setStatus('audio', b.missing.size ? `Голос загружен частично (нет ${b.missing.size} из ${ALL_KEYS.length})`
+                                          : 'Голос загружен', b.missing.size > 0);
+        cacheForOffline(b, base, listed);
+      })().catch((e) => {
+        if (bank !== b) return;
+        b.error = e.reason || 'offline';
+        setStatus('audio', 'Голос недоступен — таймер будет без звука', true);
+      }).then(() => {
+        if (bank === b) prepareFor(readMinutes() || 1);
+      });
+      return b.ready;
+    }
+
+    function decodeKey(key, b = bank) {
+      if (b.decoded.has(key)) return Promise.resolve(b.decoded.get(key));
+      if (b.pending.has(key)) return b.pending.get(key);
+      const raw = b.raw.get(key);
+      if (!raw || !getCtx()) return Promise.resolve(null);
+      // decodeAudioData «отбирает» ArrayBuffer — передаём копию, оригинал оставляем.
+      const p = decodeAudio(raw.slice(0))
+        .then((buf) => { b.decoded.set(key, buf); return buf; })
+        .catch(() => { b.raw.delete(key); b.missing.set(key, 'invalid'); return null; })
+        .finally(() => b.pending.delete(key));
+      b.pending.set(key, p);
+      return p;
+    }
+
+    // Фразы, которые могут понадобиться для таймера на n минут.
+    function neededKeys(n) {
+      const keys = ['left_30s', 'resume', 'pause', 'done', `start_${n}`];
+      for (let i = 1; i <= 10; i++) keys.push(`count_${i}`);
+      for (let m = 1; m <= n; m++) keys.push(`left_min_${m}`);
+      return keys;
+    }
+    async function prepareFor(n) {
+      const b = bank;
+      await b.ready;
+      await Promise.all(neededKeys(n).map((k) => decodeKey(k, b)));
+      if (bank === b) updateAudioAlert(n);
+    }
+
+    // Показывает, чего не хватает именно для выбранной длительности.
+    function updateAudioAlert(n = readMinutes() || 1) {
+      const b = bank;
+      const cmd = `<code>python3 tools/make_audio.py --voice ${esc(b.voice)}</code>`;
+      if (!AC) {
+        showAlert('Звук не поддерживается', 'Этот браузер не умеет Web Audio — таймер будет работать без голоса.',
+                  { error: false, retry: false });
+        return;
+      }
+      if (b.error === 'offline') {
+        showAlert('Нет сети', `Голос «${esc(b.voice)}» ещё не сохранён на устройстве. Подключитесь к интернету ` +
+                  'и откройте приложение — после загрузки оно будет работать офлайн. Пока таймер будет без звука.');
+        return;
+      }
+      if (b.error) {
+        const what = b.error === 'invalid' ? 'Файл <code>phrases.json</code> повреждён.'
+          : b.error === 'http' ? 'Сервер не отдал аудиофайлы.'
+          : `Не найдены файлы в <code>audio/${esc(b.voice)}/</code>.`;
+        showAlert('Аудиофайлы отсутствуют', `${what} Сгенерируйте озвучку: ${cmd} — пока таймер будет без звука.`);
+        return;
+      }
+      const lacking = neededKeys(n).filter((k) => b.missing.has(k));
+      if (!lacking.length) { hideAlert(); return; }
+      const offline = lacking.some((k) => b.missing.get(k) === 'offline');
+      const list = lacking.slice(0, 6).map((k) => `<code>${esc(k)}</code>`).join(', ') +
+                   (lacking.length > 6 ? ` и ещё ${lacking.length - 6}` : '');
+      showAlert(`Не хватает ${lacking.length} ${plural(lacking.length, 'фразы', 'фраз', 'фраз')}`,
+                `Для таймера на ${n} мин. отсутствуют: ${list}. Эти фразы не прозвучат. ` +
+                (offline ? 'Часть файлов не скачалась — проверьте сеть и нажмите «Повторить».'
+                         : `Догенерируйте их: ${cmd}`),
+                { error: false });
+    }
+
+    // ---------- Офлайн ----------
+    // При первом визите страница грузит аудио ещё до того, как service worker взял её под контроль,
+    // поэтому файлы могли не попасть в кэш. Явно просим SW докачать в кэш всё, что нужно голосу.
+    async function cacheForOffline(b, base, keys) {
+      if (!('serviceWorker' in navigator) || !window.caches) return;
+      try {
+        const reg = await navigator.serviceWorker.ready;
+        if (!reg.active) return;
+        const urls = [AUDIO_ROOT + 'voices.json', base + 'phrases.json', ...keys.map((k) => `${base}${k}.m4a`)]
+          .map((u) => new URL(u, location.href).href);
+        const failed = await new Promise((resolve) => {
+          const ch = new MessageChannel();
+          ch.port1.onmessage = (e) => resolve(e.data && e.data.failed);
+          reg.active.postMessage({ type: 'cache-audio', urls }, [ch.port2]);
+          setTimeout(() => resolve(null), 60000);
+        });
+        if (bank !== b || failed === null) return;
+        b.offlineReady = failed === 0 && b.missing.size === 0;
+        if (b.offlineReady) {
+          setStatus('audio', 'Голос загружен, доступен офлайн');
+          // Просим браузер не вытеснять кэш (особенно важно на iOS).
+          navigator.storage?.persist?.().catch(() => {});
+        }
+      } catch (_) {}
+    }
+
+    function updateNetStatus() {
+      setStatus('net', isOffline() ? 'Офлайн' : '', false);
+    }
+    window.addEventListener('offline', updateNetStatus);
+    window.addEventListener('online', () => {
+      updateNetStatus();
+      // Сеть вернулась — докачиваем то, что не загрузилось из-за её отсутствия (но не посреди отсчёта).
+      const b = bank;
+      const netFail = b.error === 'offline' || [...b.missing.values()].includes('offline');
+      if (netFail && !tickId) loadVoiceList();
+    });
+    alertRetry.addEventListener('click', () => { if (!tickId) loadVoiceList(); });
+
+    function makeSource(key, when) {
+      const buf = bank.decoded.get(key);
+      if (!buf || !ctx) return null;
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(master);
+      src.start(Math.max(when, ctx.currentTime));
+      return src;
+    }
+    function killSource(src) {
+      if (!src) return;
+      src.onended = null;
+      try { src.stop(); } catch (_) {}
+      try { src.disconnect(); } catch (_) {}
+    }
+
+    // Немедленная фраза (старт/продолжение/пауза). Обрывается, если на неё «наезжает» следующее событие.
+    let nowSrc = null;
+    function playNow(key) {
+      killSource(nowSrc);
+      nowSrc = null;
+      if (!ctx || ctx.state !== 'running') return;
+      const src = makeSource(key, ctx.currentTime);
+      if (!src) return;
+      nowSrc = src;
+      src.endsAt = ctx.currentTime + src.buffer.duration;
+      src.onended = () => { if (nowSrc === src) nowSrc = null; };
+      return src;
+    }
+    function trimNowBefore(when) {
+      if (!nowSrc || when >= nowSrc.endsAt) return;
+      try { nowSrc.stop(when); } catch (_) {}
+      nowSrc.endsAt = when;
+    }
+
+    // ---------- Расписание ----------
+    function buildEvents(fromPerf, endPerf) {
+      const list = [];
+      const leftMs = endPerf - fromPerf;
+      const add = (sec, key) => {
+        const at = endPerf - sec * 1000;
+        // Фразу ровно на старте не говорим — её перекрыло бы «Таймер на N минут».
+        if (at > fromPerf + 250) list.push({ at, key, src: null, when: 0, state: 'pending' });
+      };
+      for (let m = Math.floor(leftMs / 60000); m >= 1; m--) add(m * 60, `left_min_${m}`);
+      add(30, 'left_30s');
+      for (let s = 10; s >= 1; s--) add(s, `count_${s}`);
+      list.push({ at: endPerf, key: 'done', src: null, when: 0, state: 'pending' });
+      return list;
+    }
+
+    // Планирует все будущие фразы сразу на аудиочасах (они точнее и работают, даже когда JS заморожен),
+    // а каждый тик сверяет расписание с performance.now() и поправляет уплывшие источники.
+    function pump() {
+      if (!ctx || ctx.state !== 'running' || !events.length) return;
+      sampleClock();
+      const now = ctx.currentTime;
+      for (const ev of events) {
+        if (ev.state !== 'pending' && ev.state !== 'scheduled') continue;
+        if (ev.state === 'scheduled' && ev.when <= now + 0.01) { ev.state = 'started'; continue; }
+        if (!bank.decoded.has(ev.key)) continue;     // ещё декодируется — подхватим на следующем тике
+        const desired = toCtxTime(ev.at);
+        if (ev.state === 'scheduled' && Math.abs(desired - ev.when) <= RESYNC_S) continue;
+        killSource(ev.src);
+        ev.src = null;
+        if (desired < now - STALE_S && ev.key !== 'done') { ev.state = 'skipped'; continue; }
+        ev.when = Math.max(desired, now);
+        ev.src = makeSource(ev.key, ev.when);
+        ev.state = ev.src ? 'scheduled' : 'skipped';
+      }
+      const next = events.find((e) => e.state === 'scheduled');
+      if (next) trimNowBefore(next.when);
+    }
+
+    function cancelEvents() {
+      events.forEach((ev) => killSource(ev.src));
+      events = [];
+    }
+
+    // ---------- iOS / Android: экран и вибрация ----------
+    let wakeLock = null;
+    async function keepAwake() {
+      if (!('wakeLock' in navigator)) {
+        setStatus('wake', 'Не блокируйте экран: Wake Lock не поддерживается', true);
+        return;
+      }
+      if (wakeLock || document.visibilityState !== 'visible') return;
+      try {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+        if (!tickId) { releaseWake(); return; }   // таймер успели остановить, пока ждали
+        setStatus('wake', 'Экран не погаснет');
+      } catch (_) {
+        setStatus('wake', 'Не удалось запретить блокировку экрана', true);
+      }
+    }
+    function releaseWake() {
+      wakeLock?.release().catch(() => {});
+      wakeLock = null;
+      setStatus('wake', '');
+    }
+
+    // Android: Vibration API. iOS Safari его не поддерживает; в iOS 18+ короткий тактильный отклик даёт
+    // клик по <input type="checkbox" switch> — работает только внутри жеста пользователя.
+    const hapticLabel = (() => {
+      const label = document.createElement('label');
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.setAttribute('switch', '');
+      label.appendChild(input);
+      label.style.display = 'none';
+      label.setAttribute('aria-hidden', 'true');
+      document.body.appendChild(label);
+      return label;
+    })();
+    function vibrate(pattern) {
+      if (navigator.vibrate) { navigator.vibrate(pattern); return; }
+      try { hapticLabel.click(); } catch (_) {}
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') return;
+      // Wake Lock снимается при сворачивании, аудиоконтекст на iOS может «прерваться» — восстанавливаем.
+      if (tickId) { keepAwake(); unlockAudio(); tick(); }
+    });
+
+    // ---------- Голоса ----------
+    async function loadVoiceList() {
+      let list = FALLBACK_VOICES;
+      try {
+        const r = await fetch(AUDIO_ROOT + 'voices.json', { cache: 'no-cache' });
+        if (r.ok) {
+          const j = await r.json();
+          if (Array.isArray(j.voices) && j.voices.length) list = j.voices;
+        }
+      } catch (_) {}
+      const saved = localStorage.getItem('audioVoice');
+      voiceSelect.innerHTML = '';
+      list.forEach((v) => {
+        const opt = new Option(v.name || v.id, v.id);
+        if (v.id === saved) opt.selected = true;
+        voiceSelect.add(opt);
+      });
+      getCtx();               // контекст создаётся «спящим»; декодировать можно и до разблокировки
+      loadVoice(voiceSelect.value);
+    }
+    voiceSelect.addEventListener('change', () => {
+      localStorage.setItem('audioVoice', voiceSelect.value);
+      loadVoice(voiceSelect.value);
+    });
+
+    // ---------- Склонение (для подписи) ----------
+    function plural(n, one, few, many) {
+      const m10 = n % 10, m100 = n % 100;
+      if (m10 === 1 && m100 !== 11) return one;
+      if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+      return many;
+    }
+
+    // ---------- Ввод ----------
+    function readMinutes() {
+      const n = Number(minutesInput.value);
+      if (!Number.isInteger(n) || n < 1 || n > 60) {
+        hint.textContent = 'Введите целое число от 1 до 60';
+        return null;
+      }
+      hint.textContent = '';
+      return n;
+    }
+
+    function render(ms) {
+      const total = Math.ceil(ms / 1000);
+      const m = Math.floor(total / 60), s = total % 60;
+      const text = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+      if (display.textContent !== text) display.textContent = text;
+    }
+
+    minutesInput.addEventListener('input', () => {
+      const n = readMinutes();
+      if (n && !tickId && !remainingMs) {
+        render(n * 60000);
+        prepareFor(n);    // заодно обновит сообщение о недостающих фразах
+      }
+    });
+
+    // ---------- Таймер ----------
+    function tick() {
+      const left = Math.max(0, endTime - performance.now());
+      render(left);
+      pump();
+      if (left <= 0) finish();
+    }
+
+    function setRunning(running) {
+      startBtn.disabled = running;
+      stopBtn.disabled = !running;
+      minutesInput.disabled = running;
+      voiceSelect.disabled = running;
+      alertRetry.disabled = running;
+    }
+
+    async function start() {
+      if (tickId) return;
+      const audioReady = unlockAudio();   // синхронно, внутри жеста
+      vibrate(30);
+      let phrase;
+      if (!remainingMs) {
+        const n = readMinutes();
+        if (!n) return;
+        remainingMs = n * 60000;
+        phrase = `start_${n}`;
+      } else {
+        phrase = 'resume';
+      }
+      const now = performance.now();
+      endTime = now + remainingMs;
+      events = buildEvents(now, endTime);
+      display.classList.remove('finished');
+      tickId = setInterval(tick, TICK_MS);
+      setRunning(true);
+      startBtn.textContent = 'Старт';
+      keepAwake();
+
+      const myTick = tickId;
+      await Promise.all([audioReady, prepareFor(Math.ceil(remainingMs / 60000))]);
+      if (tickId !== myTick) return;      // успели нажать Стоп/Сброс
+      clockOffset = null;
+      playNow(phrase);
+      tick();
+    }
+
+    function stopTicking() {
+      clearInterval(tickId);
+      tickId = null;
+    }
+
+    function stop() {
+      if (!tickId) return;
+      vibrate(30);
+      stopTicking();
+      remainingMs = Math.max(0, endTime - performance.now());
+      cancelEvents();
+      setRunning(false);
+      releaseWake();
+      startBtn.textContent = 'Продолжить';
+      playNow('pause');
+    }
+
+    function reset() {
+      vibrate(30);
+      stopTicking();
+      remainingMs = 0;
+      cancelEvents();
+      killSource(nowSrc); nowSrc = null;
+      setRunning(false);
+      releaseWake();
+      startBtn.textContent = 'Старт';
+      display.classList.remove('finished');
+      render((readMinutes() || 0) * 60000);
+    }
+
+    function finish() {
+      stopTicking();
+      remainingMs = 0;
+      // «Время вышло!» уже запланировано на аудиочасах; если не успело — играем сейчас.
+      const done = events.find((e) => e.key === 'done');
+      if (!done || done.state === 'pending' || done.state === 'skipped') playNow('done');
+      events = [];
+      setRunning(false);
+      releaseWake();
+      startBtn.textContent = 'Старт';
+      display.classList.add('finished');
+      vibrate([300, 150, 300, 150, 300]);
+    }
+
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', stop);
+    resetBtn.addEventListener('click', reset);
+
+    render(5 * 60000);
+    updateNetStatus();
+    loadVoiceList();
+
+    // ---------- Service Worker (офлайн + установка) ----------
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => navigator.serviceWorker.register('sw.js'));
+    }
+  </script>
+</body>
+</html>

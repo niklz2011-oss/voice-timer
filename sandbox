@@ -1,0 +1,10 @@
+#!/bin/bash
+set -e
+NET="--network none"
+[ "$SANDBOX_NET" = "1" ] && NET=""
+exec docker run --rm $NET \
+  --memory 2g --cpus 2 --pids-limit 256 \
+  --read-only --tmpfs /tmp \
+  -e PIP_TARGET=/app/.deps -e PYTHONPATH=/app/.deps \
+  -v "$PWD":/app -w /app \
+  python:3.12-slim sh -c "$*"
