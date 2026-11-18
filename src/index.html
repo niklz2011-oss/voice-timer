@@ -152,13 +152,18 @@
     const STALE_S = 0.3;      // событие, опоздавшее сильнее, пропускаем (кроме «Время вышло»)
     const RESYNC_S = 0.02;    // перепланируем источник, если расписание уехало больше чем на 20 мс
     const TICK_MS = 100;
+    const HORIZON_S = 90;     // на сколько секунд вперёд заранее ставим фразы на аудиочасы
+    const GAP_S = 0.05;       // минимальная пауза между фразами
 
     // ---------- Состояние таймера ----------
     // Источник истины — performance.now(): монотонные часы, не зависят от смены системного времени.
     let endTime = 0;        // момент окончания (ms, performance.now)
     let remainingMs = 0;    // остаток при паузе
+    let totalMs = 0;        // полная длительность текущего таймера
     let tickId = null;
-    let events = [];        // запланированные фразы: { at (ms perf), key, src, when, state }
+    let events = [];        // запланированные фразы: { at (ms perf), key, src, when, end, state }
+    let evHead = 0;         // индекс первого ещё не отзвучавшего события
+    let headEnd = -Infinity; // когда закончилась последняя отзвучавшая фраза (ctx time)
 
     // ---------- Статус ----------
     const statusParts = { net: '', audio: '', wake: '' };
@@ -258,9 +263,9 @@
 
     // ---------- Банк фраз выбранного голоса ----------
     // Все фразы, которые создаёт tools/make_audio.py (для проверки полноты голоса).
-    const ALL_KEYS = ['left_30s', 'resume', 'pause', 'done'];
-    for (let n = 1; n <= 60; n++) ALL_KEYS.push(`start_${n}`, `left_min_${n}`);
-    for (let n = 1; n <= 10; n++) ALL_KEYS.push(`count_${n}`);
+    const ALL_KEYS = ['pause', 'done'];
+    for (let n = 1; n <= 60; n++) ALL_KEYS.push(`count_${n}`);
+    for (let n = 2; n <= 60; n++) ALL_KEYS.push(`minute_${n}`);
 
     // missing: ключ → причина (offline | missing | invalid | http), error — фатальная ошибка голоса.
     const newBank = (id) => ({ voice: id, raw: new Map(), decoded: new Map(), pending: new Map(),
@@ -330,9 +335,9 @@
 
     // Фразы, которые могут понадобиться для таймера на n минут.
     function neededKeys(n) {
-      const keys = ['left_30s', 'resume', 'pause', 'done', `start_${n}`];
-      for (let i = 1; i <= 10; i++) keys.push(`count_${i}`);
-      for (let m = 1; m <= n; m++) keys.push(`left_min_${m}`);
+      const keys = ['pause', 'done'];
+      for (let i = 1; i <= Math.min(60, n * 60); i++) keys.push(`count_${i}`);
+      for (let m = 2; m <= n; m++) keys.push(`minute_${m}`);
       return keys;
     }
     async function prepareFor(n) {
@@ -430,7 +435,7 @@
       try { src.disconnect(); } catch (_) {}
     }
 
-    // Немедленная фраза (старт/продолжение/пауза). Обрывается, если на неё «наезжает» следующее событие.
+    // Немедленная фраза («Пауза», запасное «Время вышло!»). Обрывается, если на неё «наезжает» следующее событие.
     let nowSrc = null;
     function playNow(key) {
       killSource(nowSrc);
@@ -450,47 +455,77 @@
     }
 
     // ---------- Расписание ----------
-    function buildEvents(fromPerf, endPerf) {
+    // Счёт вслух каждую секунду: в начале s-й секунды минуты звучит «s» (1…60, затем снова 1).
+    // В начале каждой минуты, кроме первой, перед «1» — «вторая минута», «третья минута»…
+    // В конце — «Время вышло!». totalMs — полная длительность (нужна, чтобы после паузы продолжить счёт).
+    function buildEvents(fromPerf, endPerf, totalMs) {
       const list = [];
-      const leftMs = endPerf - fromPerf;
-      const add = (sec, key) => {
-        const at = endPerf - sec * 1000;
-        // Фразу ровно на старте не говорим — её перекрыло бы «Таймер на N минут».
-        if (at > fromPerf + 250) list.push({ at, key, src: null, when: 0, state: 'pending' });
+      const startPerf = endPerf - totalMs;
+      const add = (at, key) => {
+        if (at >= fromPerf - 50) list.push({ at, key, src: null, when: 0, end: 0, state: 'pending' });
       };
-      for (let m = Math.floor(leftMs / 60000); m >= 1; m--) add(m * 60, `left_min_${m}`);
-      add(30, 'left_30s');
-      for (let s = 10; s >= 1; s--) add(s, `count_${s}`);
-      list.push({ at: endPerf, key: 'done', src: null, when: 0, state: 'pending' });
+      const totalS = Math.round(totalMs / 1000);
+      for (let s = 0; s < totalS; s++) {
+        const at = startPerf + s * 1000;
+        if (s % 60 === 0 && s > 0) add(at, `minute_${s / 60 + 1}`);
+        add(at, `count_${(s % 60) + 1}`);
+      }
+      list.push({ at: endPerf, key: 'done', src: null, when: 0, end: 0, state: 'pending' });
       return list;
     }
 
-    // Планирует все будущие фразы сразу на аудиочасах (они точнее и работают, даже когда JS заморожен),
+    // Планирует фразы на аудиочасах (они точнее и работают, даже когда JS заморожен) на HORIZON_S вперёд,
     // а каждый тик сверяет расписание с performance.now() и поправляет уплывшие источники.
+    // Фразы никогда не накладываются: если предыдущая ещё звучит (например, «пятьдесят седьмая минута»),
+    // следующая сдвигается сразу за ней, а через пару секунд счёт снова совпадает с реальными секундами.
     function pump() {
       if (!ctx || ctx.state !== 'running' || !events.length) return;
       sampleClock();
       const now = ctx.currentTime;
-      for (const ev of events) {
-        if (ev.state !== 'pending' && ev.state !== 'scheduled') continue;
-        if (ev.state === 'scheduled' && ev.when <= now + 0.01) { ev.state = 'started'; continue; }
-        if (!bank.decoded.has(ev.key)) continue;     // ещё декодируется — подхватим на следующем тике
-        const desired = toCtxTime(ev.at);
-        if (ev.state === 'scheduled' && Math.abs(desired - ev.when) <= RESYNC_S) continue;
+      // Пропускаем уже отзвучавшее, чтобы не перебирать тысячи событий на каждом тике.
+      while (evHead < events.length) {
+        const e = events[evHead];
+        if (e.state === 'scheduled' && e.when <= now + 0.01) e.state = 'started';
+        if (e.state === 'skipped') evHead++;
+        else if (e.state === 'started' && e.end <= now) { headEnd = Math.max(headEnd, e.end); evHead++; }
+        else break;
+      }
+      let prevEnd = headEnd, next = null;
+      for (let i = evHead; i < events.length; i++) {
+        const ev = events[i];
+        if (ev.state === 'skipped') continue;
+        if (ev.state === 'scheduled' && ev.when <= now + 0.01) ev.state = 'started';
+        if (ev.state === 'started') { prevEnd = Math.max(prevEnd, ev.end); continue; }
+        const nominal = toCtxTime(ev.at);
+        if (nominal > now + HORIZON_S) break;
+        const desired = Math.max(nominal, prevEnd + GAP_S);
+        if (ev.state === 'scheduled' && Math.abs(desired - ev.when) <= RESYNC_S) {
+          prevEnd = ev.end;
+          next = next || ev;
+          continue;
+        }
+        if (desired < now - STALE_S && ev.key !== 'done') {
+          killSource(ev.src); ev.src = null; ev.state = 'skipped';
+          continue;
+        }
+        const buf = bank.decoded.get(ev.key);
+        if (!buf) continue;                          // ещё декодируется — подхватим на следующем тике
         killSource(ev.src);
-        ev.src = null;
-        if (desired < now - STALE_S && ev.key !== 'done') { ev.state = 'skipped'; continue; }
         ev.when = Math.max(desired, now);
         ev.src = makeSource(ev.key, ev.when);
-        ev.state = ev.src ? 'scheduled' : 'skipped';
+        if (!ev.src) { ev.state = 'skipped'; continue; }
+        ev.end = ev.when + buf.duration;
+        ev.state = 'scheduled';
+        prevEnd = ev.end;
+        next = next || ev;
       }
-      const next = events.find((e) => e.state === 'scheduled');
       if (next) trimNowBefore(next.when);
     }
 
     function cancelEvents() {
       events.forEach((ev) => killSource(ev.src));
       events = [];
+      evHead = 0; headEnd = -Infinity;
     }
 
     // ---------- iOS / Android: экран и вибрация ----------
@@ -619,18 +654,12 @@
       if (tickId) return;
       const audioReady = unlockAudio();   // синхронно, внутри жеста
       vibrate(30);
-      let phrase;
       if (!remainingMs) {
         const n = readMinutes();
         if (!n) return;
-        remainingMs = n * 60000;
-        phrase = `start_${n}`;
-      } else {
-        phrase = 'resume';
+        remainingMs = totalMs = n * 60000;
       }
-      const now = performance.now();
-      endTime = now + remainingMs;
-      events = buildEvents(now, endTime);
+      endTime = performance.now() + remainingMs;
       display.classList.remove('finished');
       tickId = setInterval(tick, TICK_MS);
       setRunning(true);
@@ -638,10 +667,15 @@
       keepAwake();
 
       const myTick = tickId;
-      await Promise.all([audioReady, prepareFor(Math.ceil(remainingMs / 60000))]);
+      await Promise.all([audioReady, prepareFor(Math.round(totalMs / 60000))]);
       if (tickId !== myTick) return;      // успели нажать Стоп/Сброс
+      // Отсчёт начинаем, когда звук готов (обычно сразу), чтобы первое «один» не потерялось.
+      const now = performance.now();
+      endTime = now + remainingMs;
+      killSource(nowSrc); nowSrc = null;  // «Пауза» не должна наложиться на счёт
+      events = buildEvents(now, endTime, totalMs);
+      evHead = 0; headEnd = -Infinity;
       clockOffset = null;
-      playNow(phrase);
       tick();
     }
 
@@ -682,6 +716,7 @@
       const done = events.find((e) => e.key === 'done');
       if (!done || done.state === 'pending' || done.state === 'skipped') playNow('done');
       events = [];
+      evHead = 0; headEnd = -Infinity;
       setRunning(false);
       releaseWake();
       startBtn.textContent = 'Старт';
