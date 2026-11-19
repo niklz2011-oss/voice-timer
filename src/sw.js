@@ -1,5 +1,5 @@
 // Service worker: кэширует оболочку приложения и аудиофайлы для работы офлайн.
-const CACHE = 'voice-timer-v5';
+const CACHE = 'voice-timer-v6';
 // Аудио кэшируется «навсегда» — при перегенерации фраз меняем номер, иначе останутся старые файлы.
 const AUDIO_CACHE = 'voice-timer-audio-v2';
 const ASSETS = [
