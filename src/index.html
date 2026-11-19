@@ -154,6 +154,7 @@
     const TICK_MS = 100;
     const HORIZON_S = 90;     // на сколько секунд вперёд заранее ставим фразы на аудиочасы
     const GAP_S = 0.05;       // минимальная пауза между фразами
+    const START_LEAD_S = 0.03; // запас на планирование первой фразы (сверх задержки вывода)
 
     // ---------- Состояние таймера ----------
     // Источник истины — performance.now(): монотонные часы, не зависят от смены системного времени.
@@ -242,24 +243,25 @@
       });
     }
 
-    // Связь часов: ctxTime = perfMs / 1000 + clockOffset.
-    // getOutputTimestamp даёт пару (время контекста, которое сейчас звучит в динамике ↔ performance.now),
-    // так что фраза начинает звучать ровно в нужный момент с учётом задержки вывода.
-    let clockOffset = null;
+    // Задержка вывода: от момента на аудиочасах (ctx.currentTime) до звука в динамике/наушниках.
+    // baseLatency — буфер самого контекста, outputLatency — путь до устройства (у Bluetooth до 0,2–0,3 с).
+    function audioLatency() {
+      if (!ctx) return 0;
+      const l = (Number(ctx.baseLatency) || 0) + (Number(ctx.outputLatency) || 0);
+      return l > 0 && l < 1 ? l : 0;
+    }
+
+    // Связь часов: фраза, поставленная на ctxTime, слышна в момент perfMs, где
+    // ctxTime = perfMs / 1000 + clockOffset − latency. Так звук и экран живут по одним часам performance.now().
+    let clockOffset = null, latency = 0;
     function sampleClock() {
-      let c = ctx.currentTime, p = performance.now();
-      if (ctx.getOutputTimestamp) {
-        const t = ctx.getOutputTimestamp();
-        if (t.contextTime > 0 && t.performanceTime > 0 && Math.abs(t.performanceTime - p) < 1000) {
-          c = t.contextTime; p = t.performanceTime;
-        }
-      }
-      const o = c - p / 1000;
+      const o = ctx.currentTime - performance.now() / 1000;
       // Сглаживаем дрожание; при скачке (контекст был приостановлен) — берём сразу.
       if (clockOffset === null || Math.abs(o - clockOffset) > 0.1) clockOffset = o;
       else clockOffset += (o - clockOffset) * 0.1;
+      latency = audioLatency();   // может измениться (подключили наушники) — перечитываем каждый тик
     }
-    const toCtxTime = (perfMs) => perfMs / 1000 + clockOffset;
+    const toCtxTime = (perfMs) => perfMs / 1000 + clockOffset - latency;
 
     // ---------- Банк фраз выбранного голоса ----------
     // Все фразы, которые создаёт tools/make_audio.py (для проверки полноты голоса).
@@ -455,9 +457,11 @@
     }
 
     // ---------- Расписание ----------
-    // Счёт вслух каждую секунду: в начале s-й секунды минуты звучит «s» (1…60, затем снова 1).
-    // В начале каждой минуты, кроме первой, перед «1» — «вторая минута», «третья минута»…
-    // В конце — «Время вышло!». totalMs — полная длительность (нужна, чтобы после паузы продолжить счёт).
+    // Единый отсчёт для экрана и звука: границы секунд — startPerf + s·1000 (startPerf = endPerf − totalMs).
+    // На каждой границе экран меняется (render считает остаток от того же endTime), и в тот же момент
+    // в динамике начинается фраза: «s+1» (1…60, затем снова 1); в начале каждой минуты, кроме первой,
+    // перед «1» — «вторая минута», «третья минута»…; на последней границе, вместе с 00:00, — «Время вышло!».
+    // totalMs — полная длительность (нужна, чтобы после паузы продолжить счёт).
     function buildEvents(fromPerf, endPerf, totalMs) {
       const list = [];
       const startPerf = endPerf - totalMs;
@@ -635,11 +639,27 @@
     });
 
     // ---------- Таймер ----------
+    // Остаток по единым часам. До старта отсчёта (пока ждём звук и запас на задержку вывода) — не больше
+    // remainingMs, чтобы экран не показал лишнюю секунду.
+    const leftMs = (now = performance.now()) => Math.min(remainingMs, Math.max(0, endTime - now));
+
     function tick() {
-      const left = Math.max(0, endTime - performance.now());
+      if (!endTime) return;               // отсчёт ещё не начат: ждём готовности звука
+      const left = leftMs();
       render(left);
       pump();
       if (left <= 0) finish();
+    }
+
+    // Экран обновляем каждый кадр, а не раз в 100 мс: цифра меняется в тот же кадр, когда граница секунды
+    // наступила по performance.now() — в этот же момент фраза доходит до динамика. Интервал tick нужен для
+    // планирования звука и работы в фоне (там requestAnimationFrame не вызывается).
+    function frame() {
+      if (!tickId || !endTime) return;
+      const left = leftMs();
+      render(left);
+      if (left <= 0) tick();
+      else requestAnimationFrame(frame);
     }
 
     function setRunning(running) {
@@ -659,8 +679,9 @@
         if (!n) return;
         remainingMs = totalMs = n * 60000;
       }
-      endTime = performance.now() + remainingMs;
+      endTime = 0;                        // экран стоит, пока звук не готов — иначе он ушёл бы вперёд голоса
       display.classList.remove('finished');
+      render(remainingMs);
       tickId = setInterval(tick, TICK_MS);
       setRunning(true);
       startBtn.textContent = 'Старт';
@@ -669,14 +690,17 @@
       const myTick = tickId;
       await Promise.all([audioReady, prepareFor(Math.round(totalMs / 60000))]);
       if (tickId !== myTick) return;      // успели нажать Стоп/Сброс
-      // Отсчёт начинаем, когда звук готов (обычно сразу), чтобы первое «один» не потерялось.
-      const now = performance.now();
-      endTime = now + remainingMs;
       killSource(nowSrc); nowSrc = null;  // «Пауза» не должна наложиться на счёт
-      events = buildEvents(now, endTime, totalMs);
-      evHead = 0; headEnd = -Infinity;
+      // Отсчёт начинаем, когда звук готов, с запасом на задержку вывода: фраза на нулевой границе
+      // физически не может прозвучать раньше, чем через latency, — сдвигаем на это всю шкалу.
       clockOffset = null;
+      if (ctx && ctx.state === 'running') sampleClock();
+      const t0 = performance.now() + (latency + START_LEAD_S) * 1000;
+      endTime = t0 + remainingMs;
+      events = buildEvents(t0, endTime, totalMs);
+      evHead = 0; headEnd = -Infinity;
       tick();
+      requestAnimationFrame(frame);
     }
 
     function stopTicking() {
@@ -688,7 +712,7 @@
       if (!tickId) return;
       vibrate(30);
       stopTicking();
-      remainingMs = Math.max(0, endTime - performance.now());
+      if (endTime) remainingMs = leftMs();  // если отсчёт ещё не начался — остаток прежний
       cancelEvents();
       setRunning(false);
       releaseWake();
